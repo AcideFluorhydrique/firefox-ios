@@ -95,28 +95,38 @@ jobs:
             firefox-ios/Client.xcodeproj/project.pbxproj
           grep -o 'codesign --force --deep --sign [^ ]*' firefox-ios/Client.xcodeproj/project.pbxproj
 
+      - name: Resolve Swift packages
+        working-directory: firefox-ios
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Client.xcodeproj \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/xcbuild/SourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+      # 不要在命令列加 -sdk / ARCHS：那會套用到所有 target，
+      # 連在 Mac 上執行的 Swift macro 也被當成 iOS 編譯，找不到 SwiftSyntax
       - name: Build
         working-directory: firefox-ios
         run: |
-          set -o pipefail
+          set +e
           xcodebuild \
             -project Client.xcodeproj \
             -scheme "$SCHEME" \
-            -sdk "$XCODE_SDK" \
             -destination "$XCODE_DEST" \
             -derivedDataPath "$GITHUB_WORKSPACE/xcbuild" \
             -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/xcbuild/SourcePackages" \
             -skipMacroValidation \
             -skipPackagePluginValidation \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            build 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log" | grep -E 'error:|\*\* BUILD' || true
-          test ${PIPESTATUS[0]} -eq 0
+            build > "$GITHUB_WORKSPACE/xcodebuild.log" 2>&1
+          STATUS=$?
+          grep -E 'error:|\*\* BUILD' "$GITHUB_WORKSPACE/xcodebuild.log" | head -n 100
+          exit $STATUS
 
       - name: Package
         run: |
@@ -124,6 +134,7 @@ jobs:
           APP=$(find xcbuild/Build/Products -maxdepth 2 -path "*-$XCODE_SDK/*.app" -type d | head -n1)
           echo "App: $APP"
           test -n "$APP"
+          test -x "$APP/$(defaults read "$PWD/$APP/Info.plist" CFBundleExecutable)"
           du -sh "$APP"
           NAME="firefox-ios-$SCHEME"
           if [ "$XCODE_SDK" = "iphonesimulator" ]; then
