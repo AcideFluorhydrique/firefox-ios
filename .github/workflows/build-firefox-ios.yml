@@ -1,0 +1,151 @@
+name: Build Firefox iOS (unsigned)
+
+# 只編譯 + 打包，不跑測試、不發 Slack、不需要任何 secrets。
+# 參考 bitrise.yml 裡官方的 build-for-testing 步驟：
+#   bootstrap.sh firefox -> resolve SPM -> xcodebuild -scheme Fennec
+# 產物：
+#   simulator -> Fennec 的 .app（zip），可拖進 Apple Silicon Mac 的 iOS 模擬器
+#   device    -> 未簽名 .ipa，需要自己用 Sideloadly / AltStore / 自己的開發者帳號重新簽名才能裝
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "目標"
+        required: true
+        default: "simulator"
+        type: choice
+        options:
+          - simulator
+          - device
+      scheme:
+        description: "Scheme（Fennec = 開發版 Debug；Firefox = 正式版設定）"
+        required: true
+        default: "Fennec"
+        type: choice
+        options:
+          - Fennec
+          - Firefox
+      runner:
+        description: "Runner"
+        required: true
+        default: "macos-26"
+        type: choice
+        options:
+          - macos-26
+          - macos-latest
+      xcode:
+        description: "Xcode 版本（例如 26.5），留空 = 自動選 runner 上最新的"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 180
+
+    env:
+      SCHEME: ${{ inputs.scheme }}
+      XCODE_SDK: ${{ inputs.target == 'simulator' && 'iphonesimulator' || 'iphoneos' }}
+      XCODE_DEST: ${{ inputs.target == 'simulator' && 'generic/platform=iOS Simulator' || 'generic/platform=iOS' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # README 標示需要很新的 Xcode；如果 runner 上的版本太舊，編譯會在 Swift 語法/SDK 上報錯
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          if [ -n "${{ inputs.xcode }}" ]; then
+            XCODE_APP="/Applications/Xcode_${{ inputs.xcode }}.app"
+          else
+            XCODE_APP=$(ls -d /Applications/Xcode_*.app | grep -v -i beta | sort -V | tail -n1)
+          fi
+          echo "Using $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          grep -o 'Xcode-[0-9.]*' README.md | head -n1 | sed 's/^/Repo README 要求: /'
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            xcbuild/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('firefox-ios/Client.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved', 'Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      # bootstrap.sh firefox：下載 nimbus-fml、npm install、npm run build（產生 user scripts）
+      - name: Bootstrap
+        run: |
+          ./bootstrap.sh firefox
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+
+      # 專案裡有個 build phase 在實機建置時會用 EXPANDED_CODE_SIGN_IDENTITY 去 codesign 內嵌 framework，
+      # 關掉簽名後那個變數是空的，改成退回 ad-hoc 簽名 ("-")
+      - name: Patch codesign phase for unsigned device builds
+        if: inputs.target == 'device'
+        run: |
+          sed -i '' 's/--sign \\"\${EXPANDED_CODE_SIGN_IDENTITY}\\"/--sign \\"${EXPANDED_CODE_SIGN_IDENTITY:--}\\"/' \
+            firefox-ios/Client.xcodeproj/project.pbxproj
+          grep -o 'codesign --force --deep --sign [^ ]*' firefox-ios/Client.xcodeproj/project.pbxproj
+
+      - name: Build
+        working-directory: firefox-ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Client.xcodeproj \
+            -scheme "$SCHEME" \
+            -sdk "$XCODE_SDK" \
+            -destination "$XCODE_DEST" \
+            -derivedDataPath "$GITHUB_WORKSPACE/xcbuild" \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/xcbuild/SourcePackages" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log" | grep -E 'error:|\*\* BUILD' || true
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Package
+        run: |
+          mkdir -p out
+          APP=$(find xcbuild/Build/Products -maxdepth 2 -path "*-$XCODE_SDK/*.app" -type d | head -n1)
+          echo "App: $APP"
+          test -n "$APP"
+          du -sh "$APP"
+          NAME="firefox-ios-$SCHEME"
+          if [ "$XCODE_SDK" = "iphonesimulator" ]; then
+            ditto -c -k --keepParent "$APP" "out/$NAME-simulator.zip"
+          else
+            mkdir -p Payload
+            cp -R "$APP" Payload/
+            zip -qry "out/$NAME-unsigned.ipa" Payload
+          fi
+          ls -lh out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-ios-${{ inputs.scheme }}-${{ inputs.target }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ inputs.scheme }}-${{ inputs.target }}
+          path: xcodebuild.log
+          if-no-files-found: ignore
